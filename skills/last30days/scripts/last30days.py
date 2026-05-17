@@ -890,6 +890,8 @@ def main() -> int:
                 1 for it in youtube_items
                 if (it.metadata.get("transcript_highlights") or it.metadata.get("transcript_snippet"))
             ),
+            "youtube_error": report.errors_by_source.get("youtube"),
+            "x_error": report.errors_by_source.get("x"),
         }
         quality = quality_nudge.compute_quality_score(config, research_results)
         if quality.get("nudge_text"):
