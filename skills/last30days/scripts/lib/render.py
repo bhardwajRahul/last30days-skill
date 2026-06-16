@@ -434,6 +434,8 @@ def _render_pre_research_warning(report: schema.Report) -> list[str]:
 
     Returns empty list when flags are present or topic is not eligible.
     """
+    if report.artifacts.get("hiring_signals_mode"):
+        return []
     flags_present = bool(report.artifacts.get("pre_research_flags_present", False))
     if flags_present:
         return []
@@ -478,6 +480,8 @@ def _render_degraded_run_warning(report: schema.Report) -> list[str]:
     user because Claude hid stderr. User-visible stdout block is the
     backstop that makes silent degradation impossible.
     """
+    if report.artifacts.get("hiring_signals_mode"):
+        return []
     plan_source = report.artifacts.get("plan_source", "unknown")
     flags_present = bool(report.artifacts.get("pre_research_flags_present", False))
     if plan_source != "deterministic":
@@ -1012,6 +1016,26 @@ def _render_hiring_signals(report: schema.Report) -> list[str]:
             link = f"[{title}]({url})" if url else title
             detail = " | ".join(part for part in [dept, date] if part)
             out.append(f"  - {link}" + (f" ({detail})" if detail else ""))
+
+    strategic = summary.get("strategic_candidates") or []
+    if strategic:
+        out.append("")
+        out.append(
+            "- Strategic single-role signals (judge novelty yourself - a founding "
+            "or first-of-function role can outweigh a whole department; in synthesis, "
+            "distinguish \"new bets\" from \"doubling down\"):"
+        )
+        for cand in strategic[:8]:
+            title = cand.get("title") or "Job posting"
+            url = cand.get("url") or ""
+            flags = ", ".join(cand.get("flags") or [])
+            dept = cand.get("department") or ""
+            location = cand.get("location") or ""
+            date = cand.get("published_at") or "date unknown"
+            link = f"[{title}]({url})" if url else title
+            detail = " | ".join(part for part in [dept, location, date] if part)
+            tag = f" [{flags}]" if flags else ""
+            out.append(f"  - {link}{tag}" + (f" ({detail})" if detail else ""))
     return out
 
 
@@ -1299,6 +1323,9 @@ _FOOTER_SOURCES: list[tuple[str, str, str, str, list[tuple[str, str]]]] = [
     ("truthsocial", "🇺🇸", "Truth Social", "post",     [("likes", "likes"), ("reposts", "reposts")]),
     ("github",      "🐙", "GitHub",       "item",     [("reactions", "reactions"), ("comments", "comments")]),
     ("digg",        "⛏️", "Digg",         "cluster",  [("postCount", "posts"), ("uniqueAuthors", "authors")]),
+    # Jobs must appear so a scoped --hiring-signals run (jobs-only) still emits
+    # the LAW 5 footer; without it the footer was dropped entirely.
+    ("jobs",        "💼", "Jobs",         "role",     []),
 ]
 
 

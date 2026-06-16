@@ -60,6 +60,13 @@ def normalize_source_items(
     if normalizer is None:
         raise ValueError(f"Unsupported source: {source}")
     normalized = [normalizer(source, item, index, from_date, to_date) for index, item in enumerate(items)]
+    if source == "jobs":
+        # A careers board is a snapshot of CURRENTLY OPEN roles. An open posting
+        # is current evidence regardless of when it was posted, so date-windowing
+        # it drops still-open roles (the "Founding Research Scientist, Human
+        # Simulation" miss: 26 open roles filtered to 3 by a 30-day window).
+        # Keep the full board; recency is annotated, not used to drop.
+        return normalized
     require_date = source == "grounding"
     filtered = filter_by_date_range(normalized, from_date, to_date, require_date=require_date)
     if filtered:

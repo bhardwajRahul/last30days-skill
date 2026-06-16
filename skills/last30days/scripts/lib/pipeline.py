@@ -293,6 +293,10 @@ def run(
     # DEGRADED RUN banner when a named-entity topic was invoked bare
     # (source=deterministic AND no pre-research flags). LAW 7 backstop.
     bundle.artifacts["plan_source"] = plan_source
+    # Hiring-signals is deliberately jobs-only with no multi-source --plan, so
+    # the LAW 7 degraded-run and Step 0.55 pre-research banners do not apply -
+    # they would contradict the documented jobs-scoped flow. Suppress them.
+    bundle.artifacts["hiring_signals_mode"] = hiring_signals_mode
 
     # Project-mode or person-mode GitHub: run once before the main subquery loop
     _github_custom_done = False
@@ -428,7 +432,11 @@ def run(
                 freshness_mode=plan.freshness_mode,
                 ranking_query=subquery.ranking_query,
             )
-            normalized = normalized[: settings["per_stream_limit"]]
+            # Jobs is exempt from per_stream_limit: a careers board is a complete
+            # snapshot of open roles, and truncating it to the default 12 drops
+            # strategic postings (the whole point of hiring-signals coverage).
+            if source != "jobs":
+                normalized = normalized[: settings["per_stream_limit"]]
             bundle.add_items(subquery.label, source, normalized)
             if artifact:
                 bundle.artifacts.setdefault("grounding", []).append(artifact)
@@ -905,6 +913,8 @@ def _retry_thin_sources(
             freshness_mode=plan.freshness_mode,
             ranking_query=retry_subquery.ranking_query,
         )
+        if source == "jobs":
+            return source, normalized
         return source, normalized[:settings["per_stream_limit"]]
 
     retryable = [s for s in thin_sources if s not in rate_limited_sources]
