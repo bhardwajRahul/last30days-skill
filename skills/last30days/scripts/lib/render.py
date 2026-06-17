@@ -4,18 +4,11 @@ from __future__ import annotations
 
 import json
 import pathlib
-import re
 from collections import Counter
 from datetime import date
 from urllib.parse import urlparse
 
-from . import dates, schema
-
-
-_VERSION_RE = re.compile(
-    r'''^version:\s*(?:"([^"]+)"|'([^']+)'|(\S+))\s*$''',
-    re.MULTILINE,
-)
+from . import dates, schema, skill_meta
 
 
 def _skill_version() -> str:
@@ -25,11 +18,12 @@ def _skill_version() -> str:
     Hermes, etc.) do not always carry `.claude-plugin/plugin.json` — that file ships with
     plugin-cache installs but not with per-harness skill installs. SKILL.md frontmatter is
     the fallback that keeps the badge from emitting v? on those installs. Returns "?" only
-    if both sources are missing.
+    if no usable version string is found from either source (missing files, corrupt JSON,
+    or SKILL.md without a version line).
 
     A corrupt manifest at one ancestor does not shadow a valid manifest at a deeper one
-    (continue, not break). YAML frontmatter accepts double-quoted, single-quoted, or
-    unquoted version scalars.
+    (continue, not break). SKILL.md parsing accepts double-quoted, single-quoted, or
+    unquoted YAML version scalars (delegated to skill_meta.read_skill_version).
     """
     here = pathlib.Path(__file__).resolve()
     for parent in here.parents:
@@ -43,16 +37,11 @@ def _skill_version() -> str:
                 return version
 
     # No usable manifest found at any ancestor — fall back to SKILL.md frontmatter.
+    # First SKILL.md found in the walk is THIS skill's; never traverse past it.
     for parent in here.parents:
         skill_md = parent / "SKILL.md"
         if skill_md.is_file():
-            try:
-                match = _VERSION_RE.search(skill_md.read_text())
-            except (OSError, UnicodeDecodeError):
-                break
-            if match:
-                return next(g for g in match.groups() if g is not None)
-            break
+            return skill_meta.read_skill_version(skill_md) or "?"
     return "?"
 
 
@@ -81,6 +70,7 @@ SOURCE_LABELS = {
     "github": "GitHub",
     "digg": "Digg",
     "perplexity": "Perplexity",
+    "jobs": "Jobs",
 }
 
 
@@ -107,7 +97,7 @@ def render_compact(report: schema.Report, cluster_limit: int = 8, fun_level: str
     non_empty = [s for s, items in sorted(report.items_by_source.items()) if items]
     lines = [
         *_render_badge(),
-        f"# last30days v3.0.0: {report.topic}",
+        f"# last30days v{_skill_version()}: {report.topic}",
         "",
         *_assistant_safety_lines(),
         f"- Date range: {report.range_from} to {report.range_to}",
@@ -146,6 +136,10 @@ def render_compact(report: schema.Report, cluster_limit: int = 8, fun_level: str
     # block below) vs "synthesize from" (this block).
     lines.append("<!-- EVIDENCE FOR SYNTHESIS: read this, do not emit verbatim. Transform into `What I learned:` prose per LAW 2. -->")
     lines.append("")
+    hiring_block = _render_hiring_signals(report)
+    if hiring_block:
+        lines.extend(hiring_block)
+        lines.append("")
     lines.append("## Ranked Evidence Clusters")
     lines.append("")
     candidate_by_id = {candidate.candidate_id: candidate for candidate in report.ranked_candidates}
@@ -219,8 +213,13 @@ def render_for_html(
         *_render_badge(),
         *_render_html_metadata(report),
     ]
+    hiring_block = _render_hiring_signals(report)
     if synthesis_md:
         lines.extend(["", synthesis_md.strip()])
+        if hiring_block and "## Hiring Signals" not in synthesis_md:
+            lines.extend(["", *hiring_block])
+    elif hiring_block:
+        lines.extend(["", *hiring_block])
     # Data quality warnings are NOT rendered into the HTML artifact. The HTML
     # is meant to be shared (Slack, email, Notion); recipients haven't asked
     # for technical commentary about how the run was produced. Generators see
@@ -436,6 +435,8 @@ def _render_pre_research_warning(report: schema.Report) -> list[str]:
 
     Returns empty list when flags are present or topic is not eligible.
     """
+    if report.artifacts.get("hiring_signals_mode"):
+        return []
     flags_present = bool(report.artifacts.get("pre_research_flags_present", False))
     if flags_present:
         return []
@@ -480,6 +481,8 @@ def _render_degraded_run_warning(report: schema.Report) -> list[str]:
     user because Claude hid stderr. User-visible stdout block is the
     backstop that makes silent degradation impossible.
     """
+    if report.artifacts.get("hiring_signals_mode"):
+        return []
     plan_source = report.artifacts.get("plan_source", "unknown")
     flags_present = bool(report.artifacts.get("pre_research_flags_present", False))
     if plan_source != "deterministic":
@@ -544,7 +547,8 @@ def _render_comparison_scaffold(topic: str) -> list[str]:
 
     Axes match the April 9 launch-video exemplar (9 axes suited to AI-tool
     comparisons). For non-AI-tool comparisons, the synthesizer writes N/A
-    or topic-appropriate substitutes in irrelevant rows.
+    or topic-appropriate substitutes in irrelevant rows. The "What it is" row
+    grounds in first-party positioning fetched during the run when available.
     """
     entities = _parse_comparison_entities(topic)
     if not entities:
@@ -569,10 +573,18 @@ def _render_comparison_scaffold(topic: str) -> list[str]:
     ]
     body = [f"| {axis} | " + " | ".join([" "] * len(entities)) + " |" for axis in axes]
 
+    fill_instructions = (
+        "Fill each cell based on the research above. Keep cells short (5-15 words). "
+        "Use ' - ' (hyphen with spaces) not em-dashes. Write N/A for axes that do not apply to this topic class. "
+        "Ground the \"What it is\" row in first-party positioning fetched during this run's research when "
+        "available - describe each entity as it pitches itself today, never from memory. "
+        "This scaffold matches the April 9 launch-video exemplar shape."
+    )
+
     return [
         "## Head-to-Head",
         "",
-        "Fill each cell based on the research above. Keep cells short (5-15 words). Use ' - ' (hyphen with spaces) not em-dashes. Write N/A for axes that do not apply to this topic class. This scaffold matches the April 9 launch-video exemplar shape.",
+        fill_instructions,
         "",
         header,
         separator,
@@ -613,7 +625,7 @@ def render_comparison_multi(
 
     lines: list[str] = [
         *_render_badge(),
-        f"# last30days v3.0.0: {synthesized_topic}",
+        f"# last30days v{_skill_version()}: {synthesized_topic}",
         "",
         *_assistant_safety_lines(),
         f"- Comparison mode: {len(entities)} entities ({', '.join(entities)})",
@@ -801,7 +813,7 @@ def render_full(report: schema.Report) -> str:
     # Start with the same header as compact
     non_empty = [s for s, items in sorted(report.items_by_source.items()) if items]
     lines = [
-        f"# last30days v3.0.0: {report.topic}",
+        f"# last30days v{_skill_version()}: {report.topic}",
         "",
         *_assistant_safety_lines(),
         f"- Date range: {report.range_from} to {report.range_to}",
@@ -853,7 +865,7 @@ def render_full(report: schema.Report) -> str:
     lines.append("## All Items by Source")
     lines.append("")
     source_order = ["reddit", "x", "youtube", "tiktok", "instagram", "threads", "pinterest",
-                    "hackernews", "bluesky", "truthsocial", "polymarket", "grounding", "xiaohongshu", "github", "digg", "perplexity"]
+                    "hackernews", "bluesky", "truthsocial", "polymarket", "grounding", "xiaohongshu", "github", "digg", "perplexity", "jobs"]
     for source in source_order:
         items = report.items_by_source.get(source, [])
         if not items:
@@ -891,13 +903,13 @@ def render_full(report: schema.Report) -> str:
             # Transcript highlights for YouTube
             highlights = item.metadata.get("transcript_highlights", [])
             if highlights:
-                lines.append("  Highlights:")
+                lines.append("  Highlights (auto-generated transcript; may contain transcription errors):")
                 for hl in highlights[:5]:
                     lines.append(f'    - "{hl[:200]}"')
             # Full transcript snippet for YouTube
             transcript = item.metadata.get("transcript_snippet", "")
             if transcript and len(transcript) > 100:
-                lines.append(f"  <details><summary>Transcript ({len(transcript.split())} words)</summary>")
+                lines.append(f"  <details><summary>Transcript ({len(transcript.split())} words; auto-generated — may contain transcription errors)</summary>")
                 lines.append(f"  {transcript[:5000]}")
                 lines.append("  </details>")
             # Polymarket outcome prices and market details
@@ -950,6 +962,9 @@ def render_context(report: schema.Report, cluster_limit: int = 6) -> str:
     freshness_warning = _assess_data_freshness(report)
     if freshness_warning:
         lines.append(f"Freshness warning: {freshness_warning}")
+    hiring_block = _render_hiring_signals(report)
+    if hiring_block:
+        lines.extend(["", *hiring_block, ""])
     lines.append("Top clusters:")
     for cluster in report.clusters[:cluster_limit]:
         lines.append(f"- {cluster.title} [{', '.join(_source_label(source) for source in cluster.sources)}]")
@@ -970,6 +985,180 @@ def render_context(report: schema.Report, cluster_limit: int = 6) -> str:
         lines.append("Warnings:")
         lines.extend(f"- {warning}" for warning in report.warnings)
     return "\n".join(lines).strip() + "\n"
+
+
+def render_brief(report: schema.Report, cluster_limit: int = 8) -> str:
+    """Production brief for downstream pipelines (video, scripting, structured synthesis).
+
+    Reshapes ranked pipeline output into five sections that scripting pipelines
+    can consume directly: Ranked Storylines, Narrative Hooks, Topic Tensions,
+    Audience Questions, and Source Clusters. Sections 2-4 are omitted when there
+    is no matching data; Sections 1 and 5 always appear.
+    """
+    non_empty = [s for s, items in sorted(report.items_by_source.items()) if items]
+    lines = [
+        f"# Production Brief: {report.topic}",
+        "",
+        *_assistant_safety_lines(),
+        f"- Date range: {report.range_from} to {report.range_to}",
+        f"- Sources: {len(non_empty)} active ({', '.join(_source_label(s) for s in non_empty)})" if non_empty else "- Sources: none",
+        "",
+    ]
+
+    lines.append("## Ranked Storylines")
+    lines.append("")
+    candidate_by_id = {c.candidate_id: c for c in report.ranked_candidates}
+    for i, cluster in enumerate(report.clusters[:cluster_limit], start=1):
+        source_tags = ", ".join(_source_label(s) for s in cluster.sources)
+        qualifier = f" [{cluster.uncertainty.replace('-', ' ')}]" if cluster.uncertainty else ""
+        lines.append(f"### {i}. {cluster.title} (score {cluster.score:.0f}, {source_tags}){qualifier}")
+        for cid in cluster.representative_ids[:2]:
+            candidate = candidate_by_id.get(cid)
+            if not candidate:
+                continue
+            if candidate.snippet:
+                lines.append(f"- {_truncate(candidate.snippet, 280)}")
+            explanation = _format_explanation(candidate)
+            if explanation:
+                lines.append(f"  _Why: {explanation}_")
+        lines.append("")
+
+    hooks = sorted(
+        (c for c in report.ranked_candidates if c.fun_score is not None and c.fun_score >= 70),
+        key=lambda c: -(c.fun_score or 0),
+    )
+    if hooks:
+        lines.append("## Narrative Hooks")
+        lines.append("")
+        for candidate in hooks[:5]:
+            source_label = _source_label(candidate.source)
+            primary = schema.candidate_primary_item(candidate)
+            author = primary.author if primary else None
+            if author and candidate.source in ("x", "tiktok", "instagram", "threads"):
+                attribution = f"@{author} on {source_label}"
+            elif author and candidate.source == "reddit":
+                container = primary.container if primary else None
+                attribution = f"r/{container}" if container else "Reddit"
+            else:
+                attribution = source_label
+            reason = (
+                f" — {candidate.fun_explanation}"
+                if candidate.fun_explanation and candidate.fun_explanation != "heuristic-fallback"
+                else ""
+            )
+            lines.append(
+                f'- "{_truncate(candidate.title, 200)}"'
+                f" ({attribution}, fun:{candidate.fun_score:.0f}){reason}"
+            )
+        lines.append("")
+
+    tensions = [c for c in report.clusters[:cluster_limit] if c.uncertainty]
+    if tensions:
+        lines.append("## Topic Tensions")
+        lines.append("")
+        for cluster in tensions[:cluster_limit]:
+            label = cluster.uncertainty.replace("-", " ").title() if cluster.uncertainty else ""
+            source_tags = ", ".join(_source_label(s) for s in cluster.sources)
+            lines.append(f"- **{cluster.title}** [{label}]: {source_tags}")
+        lines.append("")
+
+    questions = _extract_audience_questions(report.ranked_candidates)
+    if questions:
+        lines.append("## Audience Questions")
+        lines.append("")
+        for q in questions[:8]:
+            lines.append(f"- {q}")
+        lines.append("")
+
+    lines.append("## Source Clusters")
+    lines.append("")
+    for cluster in report.clusters[:cluster_limit]:
+        source_tags = " + ".join(_source_label(s) for s in cluster.sources)
+        lines.append(f"- **{cluster.title}**: {source_tags}")
+    lines.append("")
+
+    return "\n".join(lines).strip() + "\n"
+
+
+def _extract_audience_questions(candidates: list[schema.Candidate]) -> list[str]:
+    """Return titles that read as audience questions, deduped and in ranked order."""
+    questions: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        title = candidate.title.strip()
+        if not title:
+            continue
+        if title.endswith("?"):
+            norm = title.lower()
+            if norm not in seen:
+                seen.add(norm)
+                questions.append(title)
+    return questions
+
+
+def _render_hiring_signals(report: schema.Report) -> list[str]:
+    summary = report.artifacts.get("hiring_signals")
+    if not isinstance(summary, dict):
+        return []
+    signals = summary.get("signals") or []
+    include = bool(summary.get("include"))
+    mode = summary.get("mode") or "standard"
+    if not include and mode != "explicit":
+        return []
+
+    out = [
+        "## Hiring Signals",
+        "",
+        (
+            f"- Mode: {mode}; company-size tier: "
+            f"{summary.get('company_size_tier') or 'unknown'}"
+        ),
+    ]
+    if not signals:
+        reason = summary.get("omitted_reason") or "no reliable hiring signal found"
+        out.append(f"- No reliable hiring signal found: {reason}.")
+        return out
+
+    out.append(
+        "- Interpret these as focus or priority signals, not exact roadmap predictions."
+    )
+    for signal in signals[:4]:
+        evidence = signal.get("evidence") or []
+        out.append(
+            f"- {signal.get('theme', 'hiring theme')}: "
+            f"{signal.get('interpretation', 'possible hiring focus')} "
+            f"(confidence: {signal.get('confidence', 'low')}; "
+            f"evidence: {signal.get('evidence_count', len(evidence))} roles)"
+        )
+        for item in evidence[:3]:
+            title = item.get("title") or "Job posting"
+            url = item.get("url") or ""
+            dept = item.get("department") or ""
+            date = item.get("published_at") or "date unknown"
+            link = f"[{title}]({url})" if url else title
+            detail = " | ".join(part for part in [dept, date] if part)
+            out.append(f"  - {link}" + (f" ({detail})" if detail else ""))
+
+    strategic = summary.get("strategic_candidates") or []
+    if strategic:
+        out.append("")
+        out.append(
+            "- Strategic single-role signals (judge novelty yourself - a founding "
+            "or first-of-function role can outweigh a whole department; in synthesis, "
+            "distinguish \"new bets\" from \"doubling down\"):"
+        )
+        for cand in strategic[:8]:
+            title = cand.get("title") or "Job posting"
+            url = cand.get("url") or ""
+            flags = ", ".join(cand.get("flags") or [])
+            dept = cand.get("department") or ""
+            location = cand.get("location") or ""
+            date = cand.get("published_at") or "date unknown"
+            link = f"[{title}]({url})" if url else title
+            detail = " | ".join(part for part in [dept, location, date] if part)
+            tag = f" [{flags}]" if flags else ""
+            out.append(f"  - {link}{tag}" + (f" ({detail})" if detail else ""))
+    return out
 
 
 def _render_candidate(candidate: schema.Candidate, prefix: str) -> list[str]:
@@ -1010,7 +1199,7 @@ def _render_candidate(candidate: schema.Candidate, prefix: str) -> list[str]:
         lines.append(f"   - Insight: {_truncate(insight, 220)}")
     highlights = _transcript_highlights(primary)
     if highlights:
-        lines.append("   - Highlights:")
+        lines.append("   - Highlights (auto-generated transcript; may contain transcription errors):")
         for hl in highlights:
             lines.append(f'     - "{_truncate(hl, 200)}"')
     return lines
@@ -1256,6 +1445,10 @@ _FOOTER_SOURCES: list[tuple[str, str, str, str, list[tuple[str, str]]]] = [
     ("truthsocial", "🇺🇸", "Truth Social", "post",     [("likes", "likes"), ("reposts", "reposts")]),
     ("github",      "🐙", "GitHub",       "item",     [("reactions", "reactions"), ("comments", "comments")]),
     ("digg",        "⛏️", "Digg",         "cluster",  [("postCount", "posts"), ("uniqueAuthors", "authors")]),
+    # Jobs must appear so a scoped --hiring-signals run (jobs-only) still emits
+    # the LAW 5 footer; without it the footer was dropped entirely.
+    ("jobs",        "💼", "Jobs",         "role",     []),
+    ("perplexity",  "🧠", "Perplexity",   "result",    [("citations", "citations")]),
 ]
 
 
@@ -1296,15 +1489,16 @@ def _build_source_footer_lines(report: schema.Report) -> list[str]:
             if total > 0:
                 total_str = f"{total:,}" if total >= 1000 else str(total)
                 parts.append(f"{total_str} {word}")
-        # YouTube: append "N with transcripts" instead of a third likes-based column.
-        # Transcripts are a more meaningful research-depth signal than likes.
+        # YouTube: always append "M/N with transcripts" so a zero-transcript run
+        # (typically caused by a stale yt-dlp binary) is visible at the conclusion
+        # surface. Hiding zero converts a problem signal into an absence; the very
+        # case that needs to be loud is the one previously omitted from the footer.
         if source_key == "youtube":
             with_transcripts = sum(
                 1 for it in items
                 if (it.metadata.get("transcript_highlights") or it.metadata.get("transcript_snippet"))
             )
-            if with_transcripts > 0:
-                parts.append(f"{with_transcripts} with transcripts")
+            parts.append(f"{with_transcripts}/{len(items)} with transcripts")
         stats = " │ ".join(parts)
         out.append(_footer_line_for_source(emoji, label, len(items), item_word, stats))
 
@@ -1607,8 +1801,6 @@ def _stats_actor(item: schema.SourceItem) -> str | None:
         return f"r/{item.container}"
     if item.source in {"x", "bluesky", "truthsocial"} and item.author:
         return f"@{item.author.lstrip('@')}"
-    if item.source == "grounding" and item.container:
-        return item.container
     if item.source == "youtube" and item.author:
         return item.author
     if item.container and item.container != "Polymarket":

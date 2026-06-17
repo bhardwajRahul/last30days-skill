@@ -7,6 +7,9 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
+
 
 jobs:
   # Build the existing .skill artifact (Claude Code / Codex / Cursor install
@@ -14,16 +17,26 @@ jobs:
   # so the .mcpb matrix can run in parallel.
   build-skill:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Build .skill artifact
         run: |
           bash skills/last30days/scripts/build-skill.sh
           test -f dist/last30days.skill
+
+      - name: Attest .skill artifact provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/last30days.skill
 
       - name: Upload skill artifact
         uses: actions/upload-artifact@v4
@@ -51,7 +64,9 @@ jobs:
             platform: linux/amd64
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -103,10 +118,11 @@ jobs:
           path: mcp/build/last30days-pp-mcp-${{ matrix.goos }}-${{ matrix.goarch }}.mcpb
 
   # Gather every platform artifact and attach to one GitHub release.
-  # release-notes generation reads commits since the prior tag.
   release:
     needs: [build-skill, build-mcpb]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -115,11 +131,11 @@ jobs:
           merge-multiple: true
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/last30days.skill
-            dist/last30days-pp-mcp-*.mcpb
-          generate_release_notes: true
-          draft: false
-          prerelease: false
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/last30days.skill \
+            dist/last30days-pp-mcp-*.mcpb \
+            --generate-notes \
+            --verify-tag

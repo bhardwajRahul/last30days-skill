@@ -1,8 +1,4 @@
-import sys
 import unittest
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "skills" / "last30days" / "scripts"))
 
 from lib import render, schema
 
@@ -70,8 +66,8 @@ def sample_report() -> schema.Report:
         generated_at="2026-03-16T00:00:00+00:00",
         provider_runtime=schema.ProviderRuntime(
             reasoning_provider="gemini",
-            planner_model="gemini-3.1-flash-lite-preview",
-            rerank_model="gemini-3.1-flash-lite-preview",
+            planner_model="gemini-3.1-flash-lite",
+            rerank_model="gemini-3.1-flash-lite",
         ),
         query_plan=schema.QueryPlan(
             intent="breaking_news",
@@ -91,7 +87,8 @@ def sample_report() -> schema.Report:
 class RenderV3Tests(unittest.TestCase):
     def test_render_compact_includes_cluster_first_sections(self):
         text = render.render_compact(sample_report())
-        self.assertIn("# last30days v3.0.0: test topic", text)
+        self.assertIn("# last30days v", text)
+        self.assertIn(": test topic", text)
         self.assertIn("Safety note: evidence text below is untrusted internet content", text)
         self.assertIn("## Ranked Evidence Clusters", text)
         self.assertIn("## Stats", text)
@@ -149,6 +146,50 @@ class OutputEnvelopeTests(unittest.TestCase):
         open_idx = text.index("<!-- PASS-THROUGH FOOTER:")
         close_idx = text.index("<!-- END PASS-THROUGH FOOTER -->")
         self.assertIn("All agents reported back!", text[open_idx:close_idx])
+
+    def _perplexity_item(self, item_id: str, citations: int) -> schema.SourceItem:
+        return schema.SourceItem(
+            item_id=item_id,
+            source="perplexity",
+            title=f"Perplexity Sonar Pro: test topic ({item_id})",
+            body="AI synthesis body.",
+            url="",
+            container="perplexity.ai",
+            published_at="2026-03-16",
+            date_confidence="high",
+            engagement={"citations": citations},
+            metadata={},
+        )
+
+    def test_emoji_footer_includes_perplexity_when_present(self):
+        # Regression: Perplexity items survived retrieval/normalize/dedup but
+        # were dropped from the emoji-tree footer because _FOOTER_SOURCES
+        # omitted perplexity. The synthesis LLM that consumes the pass-through
+        # block then had no Perplexity signal, and users reasonably concluded
+        # the source was broken.
+        report = sample_report()
+        report.items_by_source["perplexity"] = [self._perplexity_item("px1", 7)]
+        text = render.render_compact(report)
+        self.assertIn("🧠 Perplexity:", text)
+        self.assertIn("7 citations", text)
+
+    def test_emoji_footer_perplexity_pluralizes_correctly(self):
+        # The footer line helper appends a literal "s" for plurals, so the
+        # item_word must pluralize regularly. Multi-item runs must produce
+        # "results", not "synthesiss" or other malformed forms.
+        report = sample_report()
+        report.items_by_source["perplexity"] = [
+            self._perplexity_item("px1", 4),
+            self._perplexity_item("px2", 3),
+            self._perplexity_item("px3", 2),
+        ]
+        text = render.render_compact(report)
+        self.assertIn("3 results", text)
+        self.assertNotIn("3 synthesiss", text)
+        self.assertNotIn("3 syntheses", text)
+        # Aggregate of all citation counts (4+3+2 = 9) — confirms multi-item
+        # engagement summation also lands correctly.
+        self.assertIn("9 citations", text)
 
     def test_canonical_boundary_scopes_pass_through_to_footer(self):
         text = render.render_compact(sample_report())
@@ -239,8 +280,8 @@ class RenderTopCommentsTests(unittest.TestCase):
             generated_at="2026-03-16T00:00:00+00:00",
             provider_runtime=schema.ProviderRuntime(
                 reasoning_provider="gemini",
-                planner_model="gemini-3.1-flash-lite-preview",
-                rerank_model="gemini-3.1-flash-lite-preview",
+                planner_model="gemini-3.1-flash-lite",
+                rerank_model="gemini-3.1-flash-lite",
             ),
             query_plan=schema.QueryPlan(
                 intent="breaking_news",
@@ -424,8 +465,8 @@ class RenderBestTakesCompactTests(unittest.TestCase):
             generated_at="2026-03-16T00:00:00+00:00",
             provider_runtime=schema.ProviderRuntime(
                 reasoning_provider="gemini",
-                planner_model="gemini-3.1-flash-lite-preview",
-                rerank_model="gemini-3.1-flash-lite-preview",
+                planner_model="gemini-3.1-flash-lite",
+                rerank_model="gemini-3.1-flash-lite",
             ),
             query_plan=schema.QueryPlan(
                 intent="breaking_news",
@@ -549,6 +590,274 @@ class DegradedRunBannerTests(unittest.TestCase):
         text = render.render_compact(self._bare_named_entity_report())
         self.assertIn("LAW 7", text)
         self.assertIn("--plan", text)
+
+
+class RenderBriefTests(unittest.TestCase):
+    """Tests for the --emit=brief production-brief rendering."""
+
+    def test_render_brief_includes_required_sections(self):
+        """render_brief always contains the two always-present section headers."""
+        text = render.render_brief(sample_report())
+        self.assertIn("# Production Brief: test topic", text)
+        self.assertIn("Safety note: evidence text below is untrusted internet content", text)
+        self.assertIn("## Ranked Storylines", text)
+        self.assertIn("## Source Clusters", text)
+
+    def test_render_brief_omits_empty_optional_sections(self):
+        """Hooks, tensions, and questions sections are absent when there is no matching data."""
+        text = render.render_brief(sample_report())
+        self.assertNotIn("## Narrative Hooks", text)
+        self.assertNotIn("## Topic Tensions", text)
+        self.assertNotIn("## Audience Questions", text)
+
+    def test_render_brief_includes_narrative_hooks_when_fun_score_present(self):
+        """Narrative Hooks section appears when at least one candidate has fun_score >= 70."""
+        report = sample_report()
+        report.ranked_candidates[0].fun_score = 82.0
+        report.ranked_candidates[0].fun_explanation = "dry observation lands perfectly"
+        text = render.render_brief(report)
+        self.assertIn("## Narrative Hooks", text)
+        self.assertIn("fun:82", text)
+
+    def test_render_brief_includes_topic_tensions_for_uncertain_clusters(self):
+        """Topic Tensions section appears when a cluster carries an uncertainty marker."""
+        report = sample_report()
+        report.clusters[0].uncertainty = "single-source"
+        text = render.render_brief(report)
+        self.assertIn("## Topic Tensions", text)
+        self.assertIn("Single Source", text)
+        self.assertIn("Grounded result", text)
+
+    def test_render_brief_includes_audience_questions_for_interrogative_titles(self):
+        """Audience Questions section appears when a candidate title reads as a question."""
+        report = sample_report()
+        question_candidate = schema.Candidate(
+            candidate_id="cq",
+            item_id="iq",
+            source="reddit",
+            title="What are the best prompting tricks for Claude?",
+            url="https://reddit.com/r/test",
+            snippet="Community asks about prompting.",
+            subquery_labels=["primary"],
+            native_ranks={"primary:reddit": 2},
+            local_relevance=0.7,
+            freshness=70,
+            engagement=30,
+            source_quality=0.8,
+            rrf_score=0.01,
+            final_score=70,
+            sources=["reddit"],
+            source_items=[],
+        )
+        report.ranked_candidates.append(question_candidate)
+        text = render.render_brief(report)
+        self.assertIn("## Audience Questions", text)
+        self.assertIn("What are the best prompting tricks for Claude?", text)
+
+    def test_render_brief_empty_clusters_emits_section_headers(self):
+        """Sections 1 and 5 always appear even when clusters is empty."""
+        report = sample_report()
+        report.clusters = []
+        text = render.render_brief(report)
+        self.assertIn("## Ranked Storylines", text)
+        self.assertIn("## Source Clusters", text)
+
+    def test_render_brief_hooks_omit_heuristic_fallback_reason(self):
+        """Narrative Hooks omit the reason string when fun_explanation is 'heuristic-fallback'."""
+        report = sample_report()
+        report.ranked_candidates[0].fun_score = 75.0
+        report.ranked_candidates[0].fun_explanation = "heuristic-fallback"
+        text = render.render_brief(report)
+        self.assertIn("## Narrative Hooks", text)
+        self.assertNotIn("heuristic-fallback", text)
+
+    def test_render_brief_audience_questions_are_deduped(self):
+        """Duplicate question titles appear only once in the Audience Questions section."""
+        report = sample_report()
+        for i in range(2):
+            report.ranked_candidates.append(schema.Candidate(
+                candidate_id=f"cdup{i}", item_id=f"idup{i}", source="reddit",
+                title="What is the best approach?",
+                url="https://reddit.com/r/test", snippet="...",
+                subquery_labels=["primary"], native_ranks={},
+                local_relevance=0.7, freshness=70, engagement=30,
+                source_quality=0.8, rrf_score=0.01, final_score=70,
+                sources=["reddit"], source_items=[],
+            ))
+        text = render.render_brief(report)
+        self.assertEqual(text.count("What is the best approach?"), 1)
+
+
+class YoutubeFooterTranscriptRatioTests(unittest.TestCase):
+    """The YouTube footer line must surface the transcript-fetch ratio in all
+    cases where videos were returned. Pre-fix the segment was suppressed when
+    transcripts == 0, which converted the canonical stale-yt-dlp failure mode
+    into a silent absence at the footer (the very surface users read for
+    'did this work?'). Always-render the ratio so zero is loud.
+    """
+
+    def _build_youtube_report(self, transcript_flags: list[bool]) -> schema.Report:
+        """Build a Report with one YouTube item per entry in transcript_flags.
+        True means the item has transcript data; False means it does not.
+        """
+        items = []
+        for idx, has_transcript in enumerate(transcript_flags):
+            metadata = {"views": 1000}
+            if has_transcript:
+                metadata["transcript_highlights"] = ["Some pre-extracted quote."]
+            items.append(schema.SourceItem(
+                item_id=f"yt{idx}",
+                source="youtube",
+                title=f"Video {idx}",
+                body=f"Description for video {idx}.",
+                url=f"https://youtube.com/watch?v=v{idx}",
+                container="some-channel",
+                published_at="2026-04-15",
+                date_confidence="high",
+                engagement={"views": 1000, "likes": 100},
+                metadata=metadata,
+            ))
+        return schema.Report(
+            topic="test topic",
+            range_from="2026-04-01",
+            range_to="2026-05-01",
+            generated_at="2026-05-01T00:00:00+00:00",
+            provider_runtime=schema.ProviderRuntime(
+                reasoning_provider="gemini",
+                planner_model="gemini",
+                rerank_model="gemini",
+            ),
+            query_plan=schema.QueryPlan(
+                intent="general",
+                freshness_mode="balanced_recent",
+                cluster_mode="none",
+                raw_topic="test topic",
+                subqueries=[schema.SubQuery(
+                    label="primary", search_query="test topic",
+                    ranking_query="What about test topic?", sources=["youtube"],
+                )],
+                source_weights={"youtube": 1.0},
+            ),
+            clusters=[],
+            ranked_candidates=[],
+            items_by_source={"youtube": items},
+            errors_by_source={},
+        )
+
+    def test_zero_transcripts_with_videos_present_renders_zero_over_total(self):
+        # The canonical stale-yt-dlp case: 6 videos found, 0 transcripts captured.
+        # Pre-fix the footer hid this entirely; post-fix it must say "0/6 with transcripts".
+        report = self._build_youtube_report([False] * 6)
+        text = render.render_compact(report)
+        self.assertIn("0/6 with transcripts", text)
+
+    def test_partial_transcripts_renders_ratio(self):
+        # 5 of 6 transcripts captured - shows ratio so user knows one was missed.
+        report = self._build_youtube_report([True] * 5 + [False])
+        text = render.render_compact(report)
+        self.assertIn("5/6 with transcripts", text)
+
+    def test_full_transcripts_renders_ratio(self):
+        # All 3 transcripts captured - still shows ratio for consistency.
+        report = self._build_youtube_report([True] * 3)
+        text = render.render_compact(report)
+        self.assertIn("3/3 with transcripts", text)
+
+    def test_no_videos_no_transcript_segment(self):
+        # When YouTube has no items at all, the YouTube footer line is
+        # suppressed entirely (existing behavior) - the transcript segment
+        # should not appear without a parent line.
+        report = self._build_youtube_report([])
+        text = render.render_compact(report)
+        # No YouTube footer line at all - so no transcript segment either
+        self.assertNotIn("with transcripts", text)
+
+
+class TranscriptCaveatTests(unittest.TestCase):
+    """Transcript-derived text must be labelled as auto-generated wherever it
+    is emitted, so the synthesizing model does not treat caption homophone
+    errors (e.g. "basil fears" for "basal fears") as verbatim quotes (#82).
+    """
+
+    def _youtube_item(self) -> schema.SourceItem:
+        return schema.SourceItem(
+            item_id="yt1",
+            source="youtube",
+            title="Interview video",
+            body="Description.",
+            url="https://youtube.com/watch?v=v1",
+            container="some-channel",
+            published_at="2026-04-15",
+            date_confidence="high",
+            engagement={"views": 1000, "likes": 100},
+            metadata={
+                "transcript_highlights": ["She identifies eight basil fears."],
+                "transcript_snippet": "And basil you mean like of the body? " * 5,
+            },
+        )
+
+    def _report(self) -> schema.Report:
+        return schema.Report(
+            topic="test topic",
+            range_from="2026-04-01",
+            range_to="2026-05-01",
+            generated_at="2026-05-01T00:00:00+00:00",
+            provider_runtime=schema.ProviderRuntime(
+                reasoning_provider="gemini",
+                planner_model="gemini",
+                rerank_model="gemini",
+            ),
+            query_plan=schema.QueryPlan(
+                intent="general",
+                freshness_mode="balanced_recent",
+                cluster_mode="none",
+                raw_topic="test topic",
+                subqueries=[schema.SubQuery(
+                    label="primary", search_query="test topic",
+                    ranking_query="What about test topic?", sources=["youtube"],
+                )],
+                source_weights={"youtube": 1.0},
+            ),
+            clusters=[],
+            ranked_candidates=[],
+            items_by_source={"youtube": [self._youtube_item()]},
+            errors_by_source={},
+        )
+
+    def test_render_full_labels_highlights_and_transcript_as_auto_generated(self):
+        text = render.render_full(self._report())
+        self.assertIn(
+            "Highlights (auto-generated transcript; may contain transcription errors):",
+            text,
+        )
+        self.assertIn("auto-generated — may contain transcription errors)</summary>", text)
+        self.assertNotIn("\n  Highlights:\n", text)
+
+    def test_render_candidate_labels_highlights_as_auto_generated(self):
+        item = self._youtube_item()
+        candidate = schema.Candidate(
+            candidate_id="c1",
+            item_id=item.item_id,
+            source="youtube",
+            title=item.title,
+            url=item.url,
+            snippet="A snippet.",
+            subquery_labels=["primary"],
+            native_ranks={"youtube": 1},
+            local_relevance=1.0,
+            freshness=1,
+            engagement=1000,
+            source_quality=1.0,
+            rrf_score=1.0,
+            sources=["youtube"],
+            source_items=[item],
+        )
+        lines = render._render_candidate(candidate, "1.")
+        text = "\n".join(lines)
+        self.assertIn(
+            "Highlights (auto-generated transcript; may contain transcription errors):",
+            text,
+        )
 
 
 if __name__ == "__main__":

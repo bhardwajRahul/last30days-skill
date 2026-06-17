@@ -1,14 +1,13 @@
 """Tests for YouTube transcript highlights and yt-dlp safety flags."""
 
 import json
-import sys
+import os
 import tempfile
 import unittest
 import urllib.error
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
-
-sys.path.insert(0, str(Path(__file__).parent.parent / "skills" / "last30days" / "scripts"))
 
 from lib import youtube_yt
 
@@ -85,6 +84,115 @@ class TestYtDlpFlags(unittest.TestCase):
         cmd = run_mock.call_args.args[0]
         self.assertIn("--ignore-config", cmd)
         self.assertIn("--no-cookies-from-browser", cmd)
+
+
+class TestYtDlpSubLangs(unittest.TestCase):
+    """Verify LAST30DAYS_YT_SUB_LANGS knob and language-agnostic VTT matching."""
+
+    def _fake_result(self, stdout: str = "", returncode: int = 0):
+        from lib.subproc import SubprocResult
+        return SubprocResult(returncode=returncode, stdout=stdout, stderr="")
+
+    def test_default_sub_langs_when_env_unset(self):
+        """When LAST30DAYS_YT_SUB_LANGS is not set, the default is en,es,pt."""
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LAST30DAYS_YT_SUB_LANGS", None)
+            self.assertEqual(youtube_yt._ytdlp_sub_langs(), "en,es,pt")
+
+    def test_env_var_overrides_default(self):
+        with mock.patch.dict(os.environ, {"LAST30DAYS_YT_SUB_LANGS": "fr,de"}):
+            self.assertEqual(youtube_yt._ytdlp_sub_langs(), "fr,de")
+
+    def test_env_var_normalizes_whitespace_and_case(self):
+        with mock.patch.dict(os.environ, {"LAST30DAYS_YT_SUB_LANGS": " EN , Es , PT "}):
+            self.assertEqual(youtube_yt._ytdlp_sub_langs(), "en,es,pt")
+
+    def test_env_var_handles_empty_segments(self):
+        with mock.patch.dict(os.environ, {"LAST30DAYS_YT_SUB_LANGS": "en,,pt,"}):
+            self.assertEqual(youtube_yt._ytdlp_sub_langs(), "en,pt")
+
+    def test_env_var_empty_string_falls_back_to_default(self):
+        with mock.patch.dict(os.environ, {"LAST30DAYS_YT_SUB_LANGS": "   "}):
+            self.assertEqual(youtube_yt._ytdlp_sub_langs(), "en,es,pt")
+
+    def test_transcript_cmd_uses_default_sub_langs(self):
+        """Regression: the --sub-lang arg is en,es,pt by default (issue #469)."""
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             mock.patch.dict(os.environ, {}, clear=False), \
+             mock.patch.object(youtube_yt, "is_ytdlp_installed", return_value=True), \
+             mock.patch.object(youtube_yt.subproc, "run_with_timeout", return_value=self._fake_result()) as run_mock:
+            os.environ.pop("LAST30DAYS_YT_SUB_LANGS", None)
+            youtube_yt.fetch_transcript("abc123", temp_dir)
+
+        cmd = run_mock.call_args_list[0].args[0]
+        idx = cmd.index("--sub-lang")
+        self.assertEqual(cmd[idx + 1], "en,es,pt")
+
+    def test_transcript_cmd_respects_env_var_override(self):
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             mock.patch.dict(os.environ, {"LAST30DAYS_YT_SUB_LANGS": "fr,de,it"}), \
+             mock.patch.object(youtube_yt, "is_ytdlp_installed", return_value=True), \
+             mock.patch.object(youtube_yt.subproc, "run_with_timeout", return_value=self._fake_result()) as run_mock:
+            youtube_yt.fetch_transcript("abc123", temp_dir)
+
+        cmd = run_mock.call_args_list[0].args[0]
+        idx = cmd.index("--sub-lang")
+        self.assertEqual(cmd[idx + 1], "fr,de,it")
+
+    def test_vtt_matching_picks_non_english_track(self):
+        """When yt-dlp writes a Spanish track (no English available), we read it."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Simulate yt-dlp output: only a Spanish VTT is available
+            (Path(temp_dir) / "abc123.es.vtt").write_text(
+                "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nHola mundo esta es una prueba.\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(youtube_yt, "is_ytdlp_installed", return_value=True), \
+                 mock.patch.object(youtube_yt.subproc, "run_with_timeout", return_value=self._fake_result()):
+                vtt = youtube_yt._fetch_transcript_ytdlp("abc123", temp_dir)
+
+        self.assertIsNotNone(vtt)
+        self.assertIn("Hola mundo", vtt)
+
+    def test_vtt_matching_respects_non_default_priority(self):
+        """When multiple tracks exist, the user-requested priority wins
+        over alphabetical order (regression for the Greptile review on #486)."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (Path(temp_dir) / "abc123.en.vtt").write_text(
+                "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nEnglish first track.\n",
+                encoding="utf-8",
+            )
+            (Path(temp_dir) / "abc123.es.vtt").write_text(
+                "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nSpanish second track.\n",
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, {"LAST30DAYS_YT_SUB_LANGS": "es,en"}), \
+                 mock.patch.object(youtube_yt, "is_ytdlp_installed", return_value=True), \
+                 mock.patch.object(youtube_yt.subproc, "run_with_timeout", return_value=self._fake_result()):
+                vtt = youtube_yt._fetch_transcript_ytdlp("abc123", temp_dir)
+
+        self.assertIsNotNone(vtt)
+        self.assertIn("Spanish", vtt)
+
+    def test_vtt_matching_unknown_suffix_sorts_last(self):
+        """A non-lang suffix (e.g. a stray .tmp or .live_chat) must not
+        win over a real track that just happens to be alphabetically later."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (Path(temp_dir) / "abc123.zz.vtt").write_text(
+                "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nZZ track content.\n",
+                encoding="utf-8",
+            )
+            (Path(temp_dir) / "abc123.es.vtt").write_text(
+                "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nSpanish content.\n",
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, {"LAST30DAYS_YT_SUB_LANGS": "es,en,pt"}), \
+                 mock.patch.object(youtube_yt, "is_ytdlp_installed", return_value=True), \
+                 mock.patch.object(youtube_yt.subproc, "run_with_timeout", return_value=self._fake_result()):
+                vtt = youtube_yt._fetch_transcript_ytdlp("abc123", temp_dir)
+
+        self.assertIsNotNone(vtt)
+        self.assertIn("Spanish", vtt)
 
 
 class TestExtractTranscriptHighlights(unittest.TestCase):
@@ -236,7 +344,7 @@ class TestFetchTranscriptFallback(unittest.TestCase):
              mock.patch.object(youtube_yt, "_fetch_transcript_ytdlp", return_value="WEBVTT\n\nfake") as yt_mock, \
              mock.patch.object(youtube_yt, "_fetch_transcript_direct") as direct_mock:
             result = youtube_yt.fetch_transcript("vid1", "/tmp/test")
-        yt_mock.assert_called_once_with("vid1", "/tmp/test")
+        yt_mock.assert_called_once_with("vid1", "/tmp/test", status=None)
         direct_mock.assert_not_called()
 
     def test_uses_direct_when_ytdlp_missing(self):
@@ -251,7 +359,7 @@ class TestFetchTranscriptFallback(unittest.TestCase):
              mock.patch.object(youtube_yt, "_fetch_transcript_direct", return_value=sample_vtt) as direct_mock:
             result = youtube_yt.fetch_transcript("vid2", "/tmp/test")
         yt_mock.assert_not_called()
-        direct_mock.assert_called_once_with("vid2")
+        direct_mock.assert_called_once_with("vid2", status=None)
         self.assertIsNotNone(result)
         self.assertIn("Direct transcript content", result)
 
@@ -316,23 +424,81 @@ class TestExpandYouTubeQueries(unittest.TestCase):
         self.assertIn("west", core)
 
 
-class TestInferQueryIntent(unittest.TestCase):
-    """Tests for _infer_query_intent() classification."""
+class TestTranscriptCandidateSortKey(unittest.TestCase):
+    """Tests for _transcript_candidate_sort_key recency-boosted ordering."""
 
-    def test_comparison_intent(self):
-        self.assertEqual(youtube_yt._infer_query_intent("Claude vs Gemini"), "comparison")
+    @staticmethod
+    def _d(days_ago: int) -> str:
+        return (datetime.now(timezone.utc) - timedelta(days=days_ago)).strftime("%Y-%m-%d")
 
-    def test_how_to_intent(self):
-        self.assertEqual(youtube_yt._infer_query_intent("how to deploy Kubernetes"), "how_to")
+    def _make_item(self, video_id, views, date_str):
+        return {
+            "video_id": video_id,
+            "title": f"Video {video_id}",
+            "url": f"https://www.youtube.com/watch?v={video_id}",
+            "channel_name": "TestChannel",
+            "date": date_str,
+            "engagement": {"views": views, "likes": 10, "comments": 5},
+            "relevance": 0.8,
+            "why_relevant": "test",
+            "description": "test desc",
+            "duration": 600,
+        }
 
-    def test_opinion_intent(self):
-        self.assertEqual(youtube_yt._infer_query_intent("thoughts on Claude Code"), "opinion")
+    def test_recency_breaks_views_tie(self):
+        """When views are equal, the more recent video gets a higher sort key."""
+        new = self._make_item("new", 100_000, self._d(1))
+        old = self._make_item("old", 100_000, self._d(13))
+        self.assertGreater(
+            youtube_yt._transcript_candidate_sort_key(new),
+            youtube_yt._transcript_candidate_sort_key(old),
+        )
 
-    def test_product_intent(self):
-        self.assertEqual(youtube_yt._infer_query_intent("best laptop for programming"), "product")
+    def test_old_high_view_can_still_qualify_for_transcript(self):
+        """An old video with very high views still gets a transcript slot;
+        recency is a tiebreaker, not a gate."""
+        old_high = self._make_item("old_high", 10_000_000, self._d(45))
+        recent_low = self._make_item("recent_low", 100, self._d(1))
+        self.assertGreater(
+            youtube_yt._transcript_candidate_sort_key(old_high),
+            youtube_yt._transcript_candidate_sort_key(recent_low),
+        )
 
-    def test_breaking_news_default(self):
-        self.assertEqual(youtube_yt._infer_query_intent("Kanye West"), "breaking_news")
+    def test_no_date_falls_to_back(self):
+        """An item with no date gets recency 0, sorting behind dated items."""
+        no_date = self._make_item("no_date", 50_000, "")
+        dated = self._make_item("dated", 50_000, self._d(5))
+        self.assertGreater(
+            youtube_yt._transcript_candidate_sort_key(dated),
+            youtube_yt._transcript_candidate_sort_key(no_date),
+        )
+
+    def test_transcript_candidates_pick_recent_over_old_same_views(self):
+        """search_and_transcribe selects candidates by (views, recency),
+        so a recent video is tried before an equal-view older video."""
+        items = [
+            self._make_item("old", 100_000, self._d(13)),
+            self._make_item("recent", 100_000, self._d(1)),
+            self._make_item("mid", 50_000, self._d(5)),
+        ]
+
+        def fake_search(*args, **kwargs):
+            return {"items": items}
+
+        call_args_list = []
+
+        def fake_fetch(video_ids, max_workers=5, out_captions_disabled=None):
+            call_args_list.extend(video_ids)
+            return {vid: "transcript" for vid in video_ids}
+
+        with mock.patch.object(youtube_yt, "search_youtube", side_effect=fake_search), \
+             mock.patch.object(youtube_yt, "fetch_transcripts_parallel", side_effect=fake_fetch):
+            youtube_yt.search_and_transcribe("test", self._d(14), self._d(0), depth="default")
+
+        # transcript_limit=2, attempt_count=4 (limited to 3 items)
+        # Sorted by (views, recency): recent(100k) > old(100k) > mid(50k)
+        self.assertEqual(call_args_list[:2], ["recent", "old"],
+                         "Recent video should be tried before equal-view older video")
 
 
 class TestSearchAndTranscribe(unittest.TestCase):
@@ -362,7 +528,7 @@ class TestSearchAndTranscribe(unittest.TestCase):
         ]
 
         # fetch_transcripts_parallel returns None for music videos, text for talks
-        def fake_parallel(video_ids, max_workers=5):
+        def fake_parallel(video_ids, max_workers=5, out_captions_disabled=None):
             result = {}
             for vid in video_ids:
                 if vid.startswith("talk"):
@@ -405,6 +571,262 @@ class TestSearchAndTranscribe(unittest.TestCase):
             result = youtube_yt.search_and_transcribe("nothing", "2026-03-01", "2026-03-31")
 
         ft_mock.assert_not_called()
+
+
+class TestTranscriptFetchStats(unittest.TestCase):
+    """Track yt-dlp fetch outcomes for quality_nudge (#531 false stale-yt-dlp nudge)."""
+
+    FROM_DATE = "2026-03-01"
+    TO_DATE = "2026-03-31"
+
+    def setUp(self):
+        youtube_yt.reset_transcript_fetch_stats()
+
+    def _make_item(self, video_id, views, date):
+        return {
+            "video_id": video_id,
+            "title": f"Video {video_id}",
+            "url": f"https://www.youtube.com/watch?v={video_id}",
+            "channel_name": "TestChannel",
+            "date": date,
+            "engagement": {"views": views, "likes": 10, "comments": 5},
+            "relevance": 0.8,
+            "why_relevant": "test",
+            "description": "test desc",
+            "duration": 600,
+        }
+
+    def _run(self, items, fake_parallel=None):
+        if fake_parallel is None:
+            def fake_parallel(video_ids, max_workers=5, out_captions_disabled=None):
+                return {vid: "A detailed transcript about the topic." for vid in video_ids}
+        with mock.patch.object(youtube_yt, "search_youtube", return_value={"items": items}), \
+             mock.patch.object(youtube_yt, "fetch_transcripts_parallel", side_effect=fake_parallel):
+            return youtube_yt.search_and_transcribe(
+                "test topic", self.FROM_DATE, self.TO_DATE, depth="default",
+            )
+
+    def test_fetch_stats_track_attempts_and_failures(self):
+        items = [
+            self._make_item("ok1", 3_000, "2026-03-20"),
+            self._make_item("fail1", 2_000, "2026-03-15"),
+            self._make_item("nocap1", 1_000, "2026-03-10"),
+        ]
+
+        def fake_parallel(video_ids, max_workers=5, out_captions_disabled=None):
+            result = {}
+            for vid in video_ids:
+                if vid.startswith("nocap"):
+                    result[vid] = None
+                    if out_captions_disabled is not None:
+                        out_captions_disabled.add(vid)
+                elif vid.startswith("fail"):
+                    result[vid] = None
+                else:
+                    result[vid] = "A detailed transcript about the topic."
+            return result
+
+        self._run(items, fake_parallel)
+
+        stats = youtube_yt.get_transcript_fetch_stats()
+        self.assertEqual(stats["attempts"], 3)
+        # Captions-disabled videos can never succeed; they are not failures.
+        self.assertEqual(stats["failures"], 1)
+
+    def test_fetch_stats_zero_failures_when_all_succeed(self):
+        # The #531 scenario: every fetch succeeds (on videos later pruned by
+        # freshness scoring). failures must be 0 so quality_nudge does not
+        # blame a stale yt-dlp binary.
+        items = [self._make_item(f"v{i}", 1_000 * (i + 1), "2024-01-15") for i in range(4)]
+
+        self._run(items)
+
+        stats = youtube_yt.get_transcript_fetch_stats()
+        self.assertEqual(stats["attempts"], 4)
+        self.assertEqual(stats["failures"], 0)
+
+
+class TestYtdlpSSHRouting(unittest.TestCase):
+    """LAST30DAYS_YOUTUBE_SSH_HOST routes yt-dlp invocations through SSH for residential IP."""
+
+    def setUp(self):
+        # Ensure clean env for each test
+        self._saved_env = os.environ.pop("LAST30DAYS_YOUTUBE_SSH_HOST", None)
+
+    def tearDown(self):
+        os.environ.pop("LAST30DAYS_YOUTUBE_SSH_HOST", None)
+        if self._saved_env is not None:
+            os.environ["LAST30DAYS_YOUTUBE_SSH_HOST"] = self._saved_env
+
+    def test_no_env_var_returns_none(self):
+        """Without the env var set, _ytdlp_ssh_host returns None."""
+        self.assertIsNone(youtube_yt._ytdlp_ssh_host())
+
+    def test_env_var_returns_host(self):
+        """With LAST30DAYS_YOUTUBE_SSH_HOST set, _ytdlp_ssh_host returns it."""
+        os.environ["LAST30DAYS_YOUTUBE_SSH_HOST"] = "macmini"
+        self.assertEqual(youtube_yt._ytdlp_ssh_host(), "macmini")
+
+    def test_env_var_whitespace_stripped(self):
+        """Whitespace around the host alias is stripped."""
+        os.environ["LAST30DAYS_YOUTUBE_SSH_HOST"] = "  macmini  "
+        self.assertEqual(youtube_yt._ytdlp_ssh_host(), "macmini")
+
+    def test_empty_env_var_falls_back_to_none(self):
+        """An empty env var is treated as unset."""
+        os.environ["LAST30DAYS_YOUTUBE_SSH_HOST"] = ""
+        self.assertIsNone(youtube_yt._ytdlp_ssh_host())
+
+    def test_wrap_cmd_passthrough_when_unset(self):
+        """_wrap_ytdlp_cmd returns input unchanged when SSH routing is off."""
+        cmd = ["yt-dlp", "--ignore-config", "ytsearch5:test"]
+        self.assertEqual(youtube_yt._wrap_ytdlp_cmd(cmd), cmd)
+
+    def test_wrap_cmd_prepends_ssh_when_set(self):
+        """_wrap_ytdlp_cmd prepends ssh <host> when SSH routing is on."""
+        os.environ["LAST30DAYS_YOUTUBE_SSH_HOST"] = "macmini"
+        cmd = ["yt-dlp", "--ignore-config", "ytsearch5:test"]
+        wrapped = youtube_yt._wrap_ytdlp_cmd(cmd)
+        self.assertEqual(wrapped[0], "ssh")
+        self.assertEqual(wrapped[1], "-o")
+        self.assertEqual(wrapped[2], "BatchMode=yes")
+        # `--` terminates SSH option parsing so a host starting with `-`
+        # (e.g. `-oProxyCommand=...`) cannot be reinterpreted as a flag.
+        self.assertEqual(wrapped[3], "--")
+        self.assertEqual(wrapped[4], "macmini")
+        # Final arg is the shell-quoted command string
+        self.assertIn("yt-dlp", wrapped[5])
+        self.assertIn("ytsearch5:test", wrapped[5])
+
+    def test_wrap_cmd_quotes_args_with_spaces(self):
+        """Args containing spaces or special chars are shell-quoted."""
+        os.environ["LAST30DAYS_YOUTUBE_SSH_HOST"] = "macmini"
+        cmd = ["yt-dlp", "ytsearch5:hello world", "--dump-json"]
+        wrapped = youtube_yt._wrap_ytdlp_cmd(cmd)
+        # shlex.quote wraps the whole arg in single quotes when it contains spaces
+        self.assertIn("'ytsearch5:hello world'", wrapped[5])
+
+    def test_wrap_cmd_uses_option_terminator(self):
+        """`--` is inserted before host as defense-in-depth even for valid hosts."""
+        os.environ["LAST30DAYS_YOUTUBE_SSH_HOST"] = "macmini"
+        cmd = ["yt-dlp", "--version"]
+        wrapped = youtube_yt._wrap_ytdlp_cmd(cmd)
+        dash_idx = wrapped.index("--")
+        self.assertEqual(wrapped[dash_idx + 1], "macmini")
+
+    def test_host_alias_with_dash_prefix_is_rejected(self):
+        """A host value starting with `-` is rejected by the alias validator.
+
+        Without validation, ssh could parse `-oProxyCommand=...` as a flag
+        instead of a hostname. The `--` terminator in _wrap_ytdlp_cmd is
+        defense-in-depth; this regex on _ytdlp_ssh_host() rejects the value
+        before it ever reaches the ssh command line.
+        """
+        os.environ["LAST30DAYS_YOUTUBE_SSH_HOST"] = "-oProxyCommand=evil"
+        self.assertIsNone(youtube_yt._ytdlp_ssh_host())
+        # And the wrap function falls back to the local-execution path.
+        cmd = ["yt-dlp", "--version"]
+        self.assertEqual(youtube_yt._wrap_ytdlp_cmd(cmd), cmd)
+
+    def test_host_alias_with_shell_metacharacters_is_rejected(self):
+        """Host values containing spaces, semicolons, $, etc. are rejected."""
+        for bad in ("host;rm -rf /", "host name", "host$IFS", "host`whoami`", "host&cmd"):
+            os.environ["LAST30DAYS_YOUTUBE_SSH_HOST"] = bad
+            self.assertIsNone(
+                youtube_yt._ytdlp_ssh_host(),
+                msg=f"validator should reject {bad!r}",
+            )
+
+    def test_host_alias_validator_accepts_realistic_aliases(self):
+        """Valid SSH config aliases are accepted: bare names, FQDNs, IPs."""
+        for good in ("macmini", "home-server", "pi5.local", "192.168.1.10", "homelab_box"):
+            os.environ["LAST30DAYS_YOUTUBE_SSH_HOST"] = good
+            self.assertEqual(youtube_yt._ytdlp_ssh_host(), good)
+
+    def test_is_ytdlp_installed_short_circuits_with_ssh(self):
+        """is_ytdlp_installed returns True without local check when SSH routing is on."""
+        os.environ["LAST30DAYS_YOUTUBE_SSH_HOST"] = "macmini"
+        with mock.patch("lib.youtube_yt.shutil.which", return_value=None) as which_mock:
+            self.assertTrue(youtube_yt.is_ytdlp_installed())
+            which_mock.assert_not_called()
+
+    def test_is_ytdlp_installed_falls_through_without_ssh(self):
+        """is_ytdlp_installed checks PATH normally when SSH routing is off."""
+        with mock.patch("lib.youtube_yt.shutil.which", return_value="/usr/bin/yt-dlp"):
+            self.assertTrue(youtube_yt.is_ytdlp_installed())
+        with mock.patch("lib.youtube_yt.shutil.which", return_value=None):
+            self.assertFalse(youtube_yt.is_ytdlp_installed())
+
+    def test_search_call_routes_through_ssh(self):
+        """search_youtube wraps the yt-dlp invocation when SSH routing is on."""
+        os.environ["LAST30DAYS_YOUTUBE_SSH_HOST"] = "macmini"
+        from lib.subproc import SubprocResult
+        fake_result = SubprocResult(returncode=0, stdout="", stderr="")
+        with mock.patch.object(youtube_yt.subproc, "run_with_timeout",
+                               return_value=fake_result) as run_mock:
+            youtube_yt.search_youtube("test", "2026-02-01", "2026-03-01")
+        cmd = run_mock.call_args.args[0]
+        self.assertEqual(cmd[0], "ssh")
+        self.assertEqual(cmd[3], "--")
+        self.assertEqual(cmd[4], "macmini")
+        # The shell-quoted yt-dlp invocation lives at index 5
+        self.assertIn("yt-dlp", cmd[5])
+        self.assertIn("--ignore-config", cmd[5])
+        self.assertIn("--no-cookies-from-browser", cmd[5])
+
+    def test_search_surfaces_ssh_failure_as_error(self):
+        """SSH connection failures surface as an error, not silent '0 results'."""
+        os.environ["LAST30DAYS_YOUTUBE_SSH_HOST"] = "macmini"
+        from lib.subproc import SubprocResult
+        fake_result = SubprocResult(
+            returncode=255,
+            stdout="",
+            stderr="ssh: connect to host macmini port 22: Connection refused\n",
+        )
+        with mock.patch.object(youtube_yt.subproc, "run_with_timeout",
+                               return_value=fake_result):
+            out = youtube_yt.search_youtube("test", "2026-02-01", "2026-03-01")
+        self.assertIn("error", out)
+        self.assertIn("Connection refused", out["error"])
+
+
+class TestTranscriptSSHRouting(unittest.TestCase):
+    """LAST30DAYS_YOUTUBE_SSH_HOST routes yt-dlp transcript fetches through SSH."""
+
+    def setUp(self):
+        self._saved_env = os.environ.pop("LAST30DAYS_YOUTUBE_SSH_HOST", None)
+
+    def tearDown(self):
+        os.environ.pop("LAST30DAYS_YOUTUBE_SSH_HOST", None)
+        if self._saved_env is not None:
+            os.environ["LAST30DAYS_YOUTUBE_SSH_HOST"] = self._saved_env
+
+    def test_ssh_helper_invokes_remote_mktemp_pipeline(self):
+        os.environ["LAST30DAYS_YOUTUBE_SSH_HOST"] = "macmini"
+        from lib.subproc import SubprocResult
+        fake_vtt = "WEBVTT\nKind: captions\nLanguage: en\n\n00:00:00.000 --> 00:00:02.000\nhi\n"
+        fake_result = SubprocResult(returncode=0, stdout=fake_vtt, stderr="")
+        with mock.patch.object(youtube_yt.subproc, "run_with_timeout",
+                               return_value=fake_result) as run_mock:
+            out = youtube_yt._fetch_transcript_ytdlp_via_ssh("vid1", "macmini")
+        self.assertEqual(out, fake_vtt)
+        remote_script = run_mock.call_args.args[0][5]
+        self.assertIn("mktemp -d", remote_script)
+        self.assertIn("find ", remote_script)
+
+    def test_fetch_transcript_uses_ssh_helper_when_routing_on(self):
+        os.environ["LAST30DAYS_YOUTUBE_SSH_HOST"] = "macmini"
+        fake_vtt = "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nhello there friends\n"
+        with mock.patch.object(youtube_yt, "is_ytdlp_installed", return_value=True), \
+             mock.patch.object(youtube_yt, "_fetch_transcript_ytdlp_via_ssh",
+                               return_value=fake_vtt) as ssh_mock, \
+             mock.patch.object(youtube_yt, "_fetch_transcript_ytdlp") as local_mock, \
+             mock.patch.object(youtube_yt, "_fetch_transcript_direct") as direct_mock:
+            result = youtube_yt.fetch_transcript("vidX", "/tmp/test")
+        ssh_mock.assert_called_once_with("vidX", "macmini")
+        local_mock.assert_not_called()
+        direct_mock.assert_not_called()
+        self.assertIn("hello there friends", result)
 
 
 if __name__ == "__main__":

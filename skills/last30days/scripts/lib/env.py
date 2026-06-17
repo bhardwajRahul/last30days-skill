@@ -29,6 +29,32 @@ else:
 
 CODEX_AUTH_FILE = Path(os.environ.get("CODEX_AUTH_FILE", str(Path.home() / ".codex" / "auth.json")))
 
+# macOS Keychain integration: items stored with this service prefix are picked
+# up automatically on Darwin as the lowest-priority credential source.
+# Example: `security add-generic-password -a "$USER" -s last30days-XAI_API_KEY -w "xai-..."`.
+KEYCHAIN_SERVICE_PREFIX = "last30days-"
+
+# Single source of truth for which credentials the Keychain loader looks up.
+# The setup-keychain.sh helper mirrors this list and is held in sync via
+# tests/test_env_keychain.py::test_keychain_keys_match_setup_script.
+KEYCHAIN_KEYS = (
+    "OPENAI_API_KEY", "XAI_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY",
+    "GOOGLE_GENAI_API_KEY", "SCRAPECREATORS_API_KEY", "APIFY_API_TOKEN",
+    "AUTH_TOKEN", "CT0", "BSKY_HANDLE", "BSKY_APP_PASSWORD",
+    "TRUTHSOCIAL_TOKEN", "BRAVE_API_KEY", "EXA_API_KEY", "SERPER_API_KEY",
+    "OPENROUTER_API_KEY", "PARALLEL_API_KEY", "XQUIK_API_KEY",
+    "XIAOHONGSHU_API_BASE",
+)
+
+# pass(1) integration: Linux/Unix analog of the Keychain source. Each key in
+# KEYCHAIN_KEYS is looked up at pass path f"{prefix}{KEY}", the direct analog of
+# Keychain's "last30days-<KEY>" service-name convention, so any user stores keys
+# under one namespace without editing code. The prefix is resolved at call time
+# (in get_config) from LAST30DAYS_PASS_PREFIX in the process env or a config
+# file, falling back to this default; included verbatim, so keep the trailing
+# separator. Honors PASSWORD_STORE_DIR.
+DEFAULT_PASS_PATH_PREFIX = "last30days/"
+
 AuthSource = Literal["api_key", "codex", "none"]
 AuthStatus = Literal["ok", "missing", "expired", "missing_account_id"]
 
@@ -53,6 +79,10 @@ class OpenAIAuth:
 
 def _check_file_permissions(path: Path) -> None:
     """Warn to stderr if a secrets file has overly permissive permissions."""
+    if os.name == "nt":
+        # Windows reports synthesized POSIX mode bits that do not reflect NTFS ACLs.
+        return
+
     try:
         mode = path.stat().st_mode
         # Check if group or other can read (bits 0o044)
@@ -88,6 +118,97 @@ def load_env_file(path: Path) -> dict[str, str]:
                     value = value[1:-1]
                 if key and value:
                     env[key] = value
+    return env
+
+
+def _load_keychain(keys: list[str]) -> dict[str, str]:
+    """Load credentials from macOS Keychain (no-op on other platforms).
+
+    Each key is looked up as a generic password with service name
+    ``f"{KEYCHAIN_SERVICE_PREFIX}{key}"`` for the current user. Missing items
+    and lookup failures are silent — Keychain is the lowest-priority source
+    and is meant to be additive over `.env` files and process environment.
+    """
+    import platform
+    if platform.system() != "Darwin":
+        return {}
+
+    import shutil
+    security = shutil.which("security")
+    if not security:
+        return {}
+
+    import subprocess
+    # USER can be unset under sudo, in Docker without --env USER, or in some CI
+    # runners; fall back to the OS user record so lookups still match items
+    # stored by setup-keychain.sh (which uses $USER).
+    user = os.environ.get("USER")
+    if not user:
+        try:
+            import pwd
+        except ImportError:
+            pwd = None
+
+        if pwd is not None:
+            try:
+                user = pwd.getpwuid(os.getuid()).pw_name
+            except AttributeError:
+                user = "unknown"
+        else:
+            user = "unknown"
+    env: dict[str, str] = {}
+    for key in keys:
+        try:
+            result = subprocess.run(
+                [security, "find-generic-password",
+                 "-a", user,
+                 "-s", f"{KEYCHAIN_SERVICE_PREFIX}{key}",
+                 "-w"],
+                capture_output=True, text=True, timeout=5,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            continue
+        if result.returncode == 0 and result.stdout.strip():
+            env[key] = result.stdout.strip()
+    return env
+
+
+def _load_pass(keys: list[str], prefix: str) -> dict[str, str]:
+    """Load credentials from a pass(1) store (no-op if `pass` is absent).
+
+    The Linux/Unix analog of the macOS Keychain source. Each env-var name is
+    looked up at pass path ``f"{prefix}{key}"`` — mirroring Keychain's
+    ``last30days-<key>`` service-name convention — so any user stores keys under
+    that namespace without editing code (prefix overridable via
+    ``LAST30DAYS_PASS_PREFIX``). The secret is decrypted in a subprocess and
+    read from stdout's first line (pass keeps the secret there; any metadata
+    follows) — never written to disk, never logged. Honors ``PASSWORD_STORE_DIR``.
+    Missing entries and failures are silent: pass is a lowest-priority, additive
+    source like Keychain, so an explicit .env or process-env value still wins.
+    """
+    import shutil
+    pass_bin = shutil.which("pass")
+    if not pass_bin:
+        return {}
+
+    import subprocess
+    env: dict[str, str] = {}
+    for key in keys:
+        try:
+            result = subprocess.run(
+                [pass_bin, "show", f"{prefix}{key}"],
+                capture_output=True, text=True, timeout=5,
+                encoding="utf-8", errors="replace",
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            # A timeout (GPG/pinentry hanging) or exec failure isn't a per-key
+            # condition — it means the store is unusable right now. Stop instead
+            # of paying the timeout once per key; otherwise a locked store would
+            # stall every config load by 5s x len(keys). A genuinely missing key
+            # returns fast with a non-zero exit and is handled below.
+            break
+        if result.returncode == 0 and result.stdout.strip():
+            env[key] = result.stdout.strip().splitlines()[0]
     return env
 
 
@@ -214,6 +335,7 @@ def get_config() -> dict[str, Any]:
       1. Environment variables (os.environ)
       2. .claude/last30days.env (per-project config)
       3. ~/.config/last30days/.env (global config)
+      4. macOS Keychain items prefixed ``last30days-`` (Darwin only)
     """
     # Load from global config file
     file_env = load_env_file(CONFIG_FILE) if CONFIG_FILE else {}
@@ -222,8 +344,29 @@ def get_config() -> dict[str, Any]:
     project_env_path = _find_project_env()
     project_env = load_env_file(project_env_path) if project_env_path else {}
 
-    # Merge: project overrides global
+    # Merge file sources: project > global
     merged_env = {**file_env, **project_env}
+
+    # Keychain is the lowest-priority source (Darwin only; no-op elsewhere).
+    # Loaded before openai_auth so OPENAI_API_KEY can come from Keychain too.
+    keychain_env = _load_keychain(list(KEYCHAIN_KEYS))
+    merged_env = {**keychain_env, **merged_env}
+    # pass(1) store: Linux/Unix analog of Keychain at convention path
+    # {prefix}<KEY>. Decrypts transiently so secrets stay encrypted at rest (no
+    # plaintext .env). Lowest priority: Keychain, the config files, and process
+    # env all win over it. Two efficiency guards so a user who merely has `pass`
+    # on PATH doesn't pay for it: resolve the prefix from the loaded config/env
+    # (not import time, so a .env-set LAST30DAYS_PASS_PREFIX is honored), and
+    # probe ONLY keys still unset after the higher-priority sources — an empty
+    # list short-circuits with no gpg/pinentry calls at all.
+    pass_prefix = (
+        os.environ.get("LAST30DAYS_PASS_PREFIX")
+        or merged_env.get("LAST30DAYS_PASS_PREFIX")
+        or DEFAULT_PASS_PATH_PREFIX
+    )
+    pass_missing = [k for k in KEYCHAIN_KEYS if k not in os.environ and not merged_env.get(k)]
+    pass_env = _load_pass(pass_missing, pass_prefix)
+    merged_env = {**pass_env, **merged_env}
 
     openai_auth = get_openai_auth(merged_env)
 
@@ -247,14 +390,19 @@ def get_config() -> dict[str, Any]:
         ('LAST30DAYS_RERANK_MODEL', None),
         ('LAST30DAYS_X_MODEL', None),
         ('LAST30DAYS_X_BACKEND', None),
+        ('LAST30DAYS_STORE', None),
+        ('LAST30DAYS_MEMORY_DIR', None),
         ('OPENAI_MODEL_PIN', None),
         ('XAI_MODEL_PIN', None),
+        ('OPENAI_BASE_URL', None),
+        ('XAI_BASE_URL', None),
         ('SCRAPECREATORS_API_KEY', None),
         ('APIFY_API_TOKEN', None),
         ('AUTH_TOKEN', None),
         ('CT0', None),
         ('BSKY_HANDLE', None),
         ('BSKY_APP_PASSWORD', None),
+        ('BSKY_SEARCH_HOST', None),
         ('TRUTHSOCIAL_TOKEN', None),
         ('BRAVE_API_KEY', None),
         ('EXA_API_KEY', None),
@@ -265,16 +413,45 @@ def get_config() -> dict[str, Any]:
         ('FROM_BROWSER', None),
         ('SETUP_COMPLETE', None),
         ('INCLUDE_SOURCES', ''),
+        ('EXCLUDE_SOURCES', ''),
+        ('LAST30DAYS_DEFAULT_SEARCH', ''),
+        ('LAST30DAYS_YOUTUBE_SSH_HOST', None),
+        ('LAST30DAYS_TRANSCRIPT_TIMEOUT', None),
+        ('LAST30DAYS_YT_SUB_LANGS', 'en,es,pt'),
     ]
 
     for key, default in keys:
         config[key] = os.environ.get(key) or merged_env.get(key, default)
 
-    # Track which config source was used
+    # Backward-compat: ScrapeCreators' own examples and tutorials use the
+    # SCRAPE_CREATORS_API_KEY spelling (with underscore between SCRAPE and
+    # CREATORS). Accept that form too so users who follow the vendor's docs
+    # don't silently end up with has_scrapecreators=False. Canonical name
+    # wins when both are set.
+    if not config.get('SCRAPECREATORS_API_KEY'):
+        legacy = os.environ.get('SCRAPE_CREATORS_API_KEY') or merged_env.get('SCRAPE_CREATORS_API_KEY')
+        if legacy:
+            config['SCRAPECREATORS_API_KEY'] = legacy
+
+    # Multi-key rotation: comma-separated SCRAPECREATORS_API_KEY round-robins
+    # via random.choice per run. Originally added in #268, accidentally dropped
+    # in v3.0.6, restored here.
+    sc_key_raw = config.get('SCRAPECREATORS_API_KEY') or ''
+    if ',' in sc_key_raw:
+        import random
+        sc_keys = [k.strip() for k in sc_key_raw.split(',') if k.strip()]
+        config['SCRAPECREATORS_API_KEY'] = random.choice(sc_keys) if sc_keys else ''
+
+    # Track which config source was used (highest-priority file source wins
+    # the label; keychain is only reported when nothing else is configured).
     if project_env_path:
         config['_CONFIG_SOURCE'] = f'project:{project_env_path}'
     elif CONFIG_FILE and CONFIG_FILE.exists():
         config['_CONFIG_SOURCE'] = f'global:{CONFIG_FILE}'
+    elif keychain_env:
+        config['_CONFIG_SOURCE'] = 'keychain'
+    elif pass_env:
+        config['_CONFIG_SOURCE'] = 'pass'
     else:
         config['_CONFIG_SOURCE'] = 'env_only'
 
@@ -306,32 +483,54 @@ COOKIE_DOMAINS: dict[str, dict[str, Any]] = {
 }
 
 
+def cookie_extraction_browsers(config: dict[str, Any]) -> list[str]:
+    """Browsers to try for cookie extraction, honoring FROM_BROWSER.
+
+    Default (FROM_BROWSER unset): Firefox and Safari only. These read local
+    files silently with no system dialogs. The Chromium family (Chrome, Brave,
+    Edge, Vivaldi, Opera, Arc, Chromium) is skipped because reading their
+    cookies on macOS requires the browser's Safe Storage Keychain key, which
+    triggers a system password prompt that cannot be reliably suppressed. On
+    Windows only Firefox cookie extraction is supported; Chrome and Edge use
+    DPAPI-encrypted cookie stores that are not yet supported.
+
+    - ``FROM_BROWSER=<name>`` - a single browser (e.g. ``firefox``, ``brave``,
+      ``edge``, ``arc``).
+    - ``FROM_BROWSER=auto`` - also try every Chromium browser (user accepts the
+      Keychain dialog when needed).
+    - ``FROM_BROWSER=off`` - returns [] (extraction disabled).
+
+    Returning the browser list from one place keeps the setup wizard and the
+    steady-state path on the same policy, so neither surprises the user with an
+    unrequested Keychain prompt.
+    """
+    silent_browsers = ["firefox", "safari"]
+    chromium_browsers = ["chrome", "brave", "edge", "vivaldi", "opera", "arc", "chromium"]
+    from_browser = (config.get("FROM_BROWSER") or "").strip().lower()
+    if from_browser == "off":
+        return []
+    if from_browser in silent_browsers or from_browser in chromium_browsers:
+        return [from_browser]
+    if from_browser == "auto":
+        return silent_browsers + chromium_browsers
+    return list(silent_browsers)
+
+
+
 def extract_browser_credentials(config: dict[str, Any]) -> dict[str, str]:
     """Extract auth cookies from local browsers.
 
-    Default behavior (FROM_BROWSER unset): tries Firefox and Safari only.
-    These read local files silently with no system dialogs.  Chrome is
-    skipped because ``security find-generic-password`` triggers a macOS
-    Keychain prompt that cannot be reliably suppressed.
-
-    Set ``FROM_BROWSER=auto`` to also try Chrome (accepts the dialog),
-    or ``FROM_BROWSER=off`` to disable extraction entirely.
+    Browser selection (and the Chrome-prompt caveat) is handled by
+    ``cookie_extraction_browsers``; this function just runs the extraction for
+    each configured cookie domain.
     """
-    from_browser = (config.get("FROM_BROWSER") or "").strip().lower()
-    if from_browser == "off":
+    browsers = cookie_extraction_browsers(config)
+    if not browsers:
         return {}
     try:
         from . import cookie_extract
     except ImportError:
         return {}
-    # Determine which browsers to try
-    if from_browser in ("firefox", "chrome", "safari"):
-        browsers = [from_browser]
-    elif from_browser == "auto":
-        browsers = ["firefox", "safari", "chrome"]
-    else:
-        # Default: silent browsers only (no Keychain dialog)
-        browsers = ["firefox", "safari"]
     extracted: dict[str, str] = {}
     for _service, spec in COOKIE_DOMAINS.items():
         if all(config.get(env_key) for env_key in spec["mapping"].values()):
@@ -517,12 +716,12 @@ def _parse_include_sources(config: dict[str, Any]) -> set[str]:
 def is_threads_available(config: dict[str, Any]) -> bool:
     """Check if Threads source is available.
 
-    Requires SCRAPECREATORS_API_KEY AND 'threads' in INCLUDE_SOURCES.
-    Threads is an opt-in source - it is not activated by default.
+    Returns True when SCRAPECREATORS_API_KEY is set. Threads runs alongside
+    TikTok and Instagram as part of the SC family — same key, same per-call
+    cost shape, so the same default-on rule applies. Suppress via
+    EXCLUDE_SOURCES=threads.
     """
-    if not config.get('SCRAPECREATORS_API_KEY'):
-        return False
-    return 'threads' in _parse_include_sources(config)
+    return bool(config.get('SCRAPECREATORS_API_KEY'))
 
 
 def is_instagram_available(config: dict[str, Any]) -> bool:

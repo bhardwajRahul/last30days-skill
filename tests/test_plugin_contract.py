@@ -1,9 +1,9 @@
 import json
-import re
 import tomllib
 import unittest
 from pathlib import Path
 
+from lib.skill_meta import read_skill_version
 
 ROOT = Path(__file__).resolve().parents[1]
 SKILL_ROOT = ROOT / "skills" / "last30days"
@@ -14,11 +14,10 @@ def _json(path: Path) -> dict:
 
 
 def _skill_version() -> str:
-    text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
-    match = re.search(r'^version:\s*"([^"]+)"\s*$', text, re.MULTILINE)
-    if not match:
+    version = read_skill_version(SKILL_ROOT / "SKILL.md")
+    if not version:
         raise AssertionError("SKILL.md version frontmatter not found")
-    return match.group(1)
+    return version
 
 
 class TestPluginContract(unittest.TestCase):
@@ -34,6 +33,7 @@ class TestPluginContract(unittest.TestCase):
 
         self.assertEqual(version, _skill_version())
         self.assertEqual(version, _json(ROOT / ".claude-plugin" / "plugin.json")["version"])
+        self.assertEqual(version, _json(ROOT / "gemini-extension.json")["version"])
 
         marketplace = _json(ROOT / ".claude-plugin" / "marketplace.json")
         plugins = marketplace.get("plugins") or []
@@ -67,7 +67,6 @@ class TestPluginContract(unittest.TestCase):
                 offenders.append(f"{path.relative_to(ROOT)}:{line_number}: {line.strip()}")
 
         self.assertEqual([], offenders)
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,10 +1,6 @@
-import sys
 import threading
 import unittest
-from pathlib import Path
 from unittest.mock import patch
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "skills" / "last30days" / "scripts"))
 
 from lib import pipeline
 from lib import http
@@ -52,6 +48,141 @@ class PipelineV3Tests(unittest.TestCase):
         # At least one per-subquery line.
         self.assertIn("[Planner]   sq1 label=", output)
 
+    def test_parallel_web_backend_enables_grounding_source(self):
+        plan = {
+            "intent": "news",
+            "freshness_mode": "balanced_recent",
+            "cluster_mode": "timeline",
+            "subqueries": [
+                {
+                    "label": "primary",
+                    "search_query": "test topic",
+                    "ranking_query": "What happened with test topic?",
+                    "sources": ["grounding"],
+                }
+            ],
+            "source_weights": {"grounding": 1.0},
+        }
+        report = pipeline.run(
+            topic="test topic",
+            config={"LAST30DAYS_REASONING_PROVIDER": "auto"},
+            depth="quick",
+            requested_sources=["grounding"],
+            web_backend="parallel",
+            external_plan=plan,
+        )
+        # Anchor on the stable source key, not the exact wording of the
+        # grounding.py error message. Phrasing can shift (e.g., when the
+        # missing-key check moves or the message is reworded) without
+        # changing the contract that the grounding source registers an
+        # error when its required backend key is unset.
+        self.assertIn("grounding", report.errors_by_source)
+
+    def test_hiring_signals_mode_enables_jobs_source_in_mock_run(self):
+        report = pipeline.run(
+            topic="Listen Labs",
+            config={"LAST30DAYS_REASONING_PROVIDER": "gemini"},
+            depth="quick",
+            requested_sources=["jobs"],
+            mock=True,
+            hiring_signals_mode=True,
+        )
+        self.assertIn("jobs", report.items_by_source)
+        self.assertIn("hiring_signals", report.artifacts)
+        self.assertTrue(report.artifacts["hiring_signals"]["include"])
+
+    def test_hiring_signals_mode_defaults_to_jobs_source(self):
+        report = pipeline.run(
+            topic="Listen Labs",
+            config={"LAST30DAYS_REASONING_PROVIDER": "gemini"},
+            depth="quick",
+            mock=True,
+            hiring_signals_mode=True,
+        )
+        self.assertEqual(["jobs"], sorted(report.items_by_source))
+        self.assertTrue(report.artifacts["hiring_signals"]["include"])
+
+    def test_standard_company_run_fetches_jobs_for_signal_gate(self):
+        report = pipeline.run(
+            topic="Listen Labs",
+            config={"LAST30DAYS_REASONING_PROVIDER": "gemini"},
+            depth="quick",
+            mock=True,
+        )
+        self.assertIn("jobs", report.items_by_source)
+        self.assertIn("hiring_signals", report.artifacts)
+
+    def test_standard_mock_run_does_not_add_jobs_for_generic_topic(self):
+        report = pipeline.run(
+            topic="how to deploy on Fly.io",
+            config={"LAST30DAYS_REASONING_PROVIDER": "gemini"},
+            depth="quick",
+            mock=True,
+        )
+        self.assertNotIn("jobs", report.items_by_source)
+        self.assertNotIn("hiring_signals", report.artifacts)
+
+    def test_single_word_generic_topic_does_not_add_jobs(self):
+        report = pipeline.run(
+            topic="bitcoin",
+            config={"LAST30DAYS_REASONING_PROVIDER": "gemini"},
+            depth="quick",
+            mock=True,
+        )
+        self.assertNotIn("jobs", report.items_by_source)
+        self.assertNotIn("hiring_signals", report.artifacts)
+
+    def test_question_comparison_topic_does_not_add_jobs(self):
+        report = pipeline.run(
+            topic="Python vs Ruby benchmark?",
+            config={"LAST30DAYS_REASONING_PROVIDER": "gemini"},
+            depth="quick",
+            mock=True,
+        )
+        self.assertNotIn("jobs", report.items_by_source)
+        self.assertNotIn("hiring_signals", report.artifacts)
+
+    def test_bare_language_comparison_topics_do_not_add_jobs(self):
+        for topic in ("python vs ruby", "Python vs Ruby"):
+            with self.subTest(topic=topic):
+                self.assertFalse(pipeline._company_topic_likely(topic))
+
+    def test_company_comparison_topics_add_jobs(self):
+        for topic in ("Stripe vs Brex", "OpenAI versus Anthropic"):
+            with self.subTest(topic=topic):
+                self.assertTrue(pipeline._company_topic_likely(topic))
+
+    def test_standard_mode_omits_weak_large_company_jobs_signal(self):
+        with patch("lib.pipeline._retrieve_stream") as mock_retrieve:
+            def fake_retrieve(**kwargs):
+                if kwargs["source"] == "jobs":
+                    return (
+                        [
+                            {
+                                "id": "J1",
+                                "title": "Retail Associate",
+                                "description": "Store operations",
+                                "url": "https://example.com/jobs/1",
+                                "department": "Retail",
+                                "date": "2026-06-01",
+                                "provider": "mock",
+                            }
+                        ],
+                        {},
+                    )
+                return pipeline._mock_stream_results(kwargs["source"], kwargs["subquery"])
+
+            mock_retrieve.side_effect = fake_retrieve
+            report = pipeline.run(
+                topic="Apple",
+                config={"LAST30DAYS_REASONING_PROVIDER": "gemini"},
+                depth="quick",
+                requested_sources=["jobs"],
+                mock=True,
+            )
+        self.assertNotIn("jobs", report.items_by_source)
+        self.assertFalse(report.artifacts["hiring_signals"]["include"])
+
 
 class TestSourceFetchCap(unittest.TestCase):
     """X source fetch count must be capped by MAX_SOURCE_FETCHES."""
@@ -60,6 +191,10 @@ class TestSourceFetchCap(unittest.TestCase):
         """MAX_SOURCE_FETCHES must cap X at 2 to prevent 429 cascades."""
         self.assertIn("x", pipeline.MAX_SOURCE_FETCHES)
         self.assertEqual(pipeline.MAX_SOURCE_FETCHES["x"], 2)
+
+    def test_jobs_capped_in_max_source_fetches(self):
+        self.assertIn("jobs", pipeline.MAX_SOURCE_FETCHES)
+        self.assertEqual(pipeline.MAX_SOURCE_FETCHES["jobs"], 1)
 
     def test_cap_logic_limits_source_submissions(self):
         """Verify the cap logic skips submissions beyond the limit."""
@@ -902,6 +1037,121 @@ class TestZeroKeyPipelineRun(unittest.TestCase):
         )
         for candidate in report.ranked_candidates:
             self.assertEqual("fallback-local-score", candidate.explanation)
+
+
+class TestExcludeSources(unittest.TestCase):
+    """EXCLUDE_SOURCES env var filters sources out of available_sources().
+
+    The existing INCLUDE_SOURCES allowlist (used by Perplexity opt-in) does
+    not cover this case — tiktok and instagram are added unconditionally
+    when SCRAPECREATORS_API_KEY is set, with no way to opt out short of
+    unsetting the key. EXCLUDE_SOURCES gives runs a per-invocation denylist.
+    """
+
+    def test_excludes_tiktok_and_instagram(self):
+        config = {
+            "SCRAPECREATORS_API_KEY": "test-key",
+            "EXCLUDE_SOURCES": "tiktok,instagram",
+        }
+        sources = pipeline.available_sources(config)
+        self.assertNotIn("tiktok", sources)
+        self.assertNotIn("instagram", sources)
+        self.assertIn("reddit", sources)
+        self.assertIn("hackernews", sources)
+
+    def test_no_exclusion_when_unset(self):
+        config = {"SCRAPECREATORS_API_KEY": "test-key"}
+        sources = pipeline.available_sources(config)
+        self.assertIn("tiktok", sources)
+        self.assertIn("instagram", sources)
+
+    def test_empty_exclude_sources_is_noop(self):
+        config = {
+            "SCRAPECREATORS_API_KEY": "test-key",
+            "EXCLUDE_SOURCES": "",
+        }
+        sources = pipeline.available_sources(config)
+        self.assertIn("tiktok", sources)
+        self.assertIn("instagram", sources)
+
+    def test_whitespace_and_case_insensitive(self):
+        config = {
+            "SCRAPECREATORS_API_KEY": "test-key",
+            "EXCLUDE_SOURCES": " TikTok , INSTAGRAM ",
+        }
+        sources = pipeline.available_sources(config)
+        self.assertNotIn("tiktok", sources)
+        self.assertNotIn("instagram", sources)
+
+    def test_excludes_non_scrapecreators_source(self):
+        """EXCLUDE_SOURCES applies to any source, not just SC-backed ones."""
+        config = {"EXCLUDE_SOURCES": "hackernews"}
+        sources = pipeline.available_sources(config)
+        self.assertNotIn("hackernews", sources)
+        self.assertIn("reddit", sources)
+
+
+class TestExcludeSourcesEndToEnd(unittest.TestCase):
+    """Wiring regression: EXCLUDE_SOURCES from the process environment must
+    reach available_sources() via env.get_config(). The unit tests above
+    construct config dicts directly; this one exercises the env-to-config
+    path so a missing entry in env.py's keys list is caught immediately."""
+
+    def test_exclude_sources_from_env_propagates_through_get_config(self):
+        import os
+        from unittest.mock import patch as _patch
+        from lib import env as env_mod
+        from importlib import reload
+        with _patch.dict(os.environ, {
+            "LAST30DAYS_CONFIG_DIR": "",
+            "EXCLUDE_SOURCES": "tiktok,instagram",
+            "SCRAPECREATORS_API_KEY": "fake",
+        }, clear=False):
+            reload(env_mod)
+            cfg = env_mod.get_config()
+        self.assertEqual(cfg.get("EXCLUDE_SOURCES"), "tiktok,instagram")
+        sources = pipeline.available_sources(cfg)
+        self.assertNotIn("tiktok", sources)
+        self.assertNotIn("instagram", sources)
+
+
+class TestInnerMaxWorkers(unittest.TestCase):
+    """Cap inner ThreadPoolExecutor concurrency under competitor fanout.
+
+    Without the cap, six competitor sub-runs each open their own
+    ``ThreadPoolExecutor(max_workers=16)``, peaking around 96 worker threads
+    that all hammer the same upstream APIs. ``internal_subrun=True`` should
+    reduce the inner pool so the nested fanout stays bounded.
+    """
+
+    def test_normal_run_uses_full_ceiling(self):
+        self.assertEqual(pipeline._inner_max_workers(20, internal_subrun=False), 16)
+        self.assertEqual(pipeline._inner_max_workers(10, internal_subrun=False), 10)
+        self.assertEqual(pipeline._inner_max_workers(1, internal_subrun=False), 4)
+
+    def test_subrun_caps_at_four(self):
+        self.assertEqual(pipeline._inner_max_workers(20, internal_subrun=True), 4)
+        self.assertEqual(pipeline._inner_max_workers(10, internal_subrun=True), 4)
+        self.assertEqual(pipeline._inner_max_workers(3, internal_subrun=True), 3)
+        self.assertEqual(pipeline._inner_max_workers(1, internal_subrun=True), 2)
+
+    def test_subrun_caps_total_concurrency_below_uncapped(self):
+        # Derive the outer cap from fanout so this test stays meaningful if
+        # MAX_PARALLEL_SUBRUNS is bumped. The contract under test is "subrun
+        # mode meaningfully reduces total inner-thread count", not a magic
+        # number tied to today's value of MAX_PARALLEL_SUBRUNS=6.
+        from lib import fanout
+        max_subruns = fanout.MAX_PARALLEL_SUBRUNS
+        capped = pipeline._inner_max_workers(20, internal_subrun=True) * max_subruns
+        uncapped = pipeline._inner_max_workers(20, internal_subrun=False) * max_subruns
+        self.assertLess(capped, uncapped, f"capped={capped} not < uncapped={uncapped}")
+        # The cap must cut total concurrency to at most half of the un-capped
+        # value; otherwise the cap is doing real work.
+        self.assertLessEqual(
+            capped,
+            uncapped // 2,
+            f"capped {capped} should be at most half of uncapped {uncapped}",
+        )
 
 
 if __name__ == "__main__":
