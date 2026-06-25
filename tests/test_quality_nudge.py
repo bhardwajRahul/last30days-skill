@@ -184,6 +184,47 @@ class TestSCDoesNotAffectCoreScore:
         assert "XQUIK_API_KEY" in q["nudge_text"]
 
 
+class TestYouTubeFallbackProvider:
+    """YouTube data from fallback/provider paths is degraded, not missing."""
+
+    def test_fallback_youtube_data_without_ytdlp_counts_active_not_missing(self):
+        q = _compute(
+            config_overrides={
+                "AUTH_TOKEN": "tok123",
+                "SCRAPECREATORS_API_KEY": "sc_key",
+            },
+            ytdlp_installed=False,
+            result_overrides={
+                "youtube_videos_count": 5,
+                "youtube_transcripts_count": 4,
+            },
+        )
+        assert q["score_pct"] == 100
+        assert "youtube" in q["core_active"]
+        assert "youtube" not in q["core_missing"]
+        assert "youtube" in q["core_degraded"]
+        assert q["nudge_text"] is not None
+        assert "Missing: YouTube" not in q["nudge_text"]
+        assert "Degraded: YouTube" in q["nudge_text"]
+        assert "fallback/provider" in q["nudge_text"]
+        assert "local yt-dlp is not installed" in q["nudge_text"]
+        assert "stale yt-dlp" not in q["nudge_text"].lower()
+
+    def test_no_fallback_data_without_ytdlp_still_missing(self):
+        q = _compute(
+            config_overrides={"SCRAPECREATORS_API_KEY": "sc_key"},
+            ytdlp_installed=False,
+            result_overrides={
+                "youtube_videos_count": 0,
+                "youtube_transcripts_count": 0,
+            },
+        )
+        assert "youtube" in q["core_missing"]
+        assert "youtube" not in q["core_active"]
+        assert "youtube" not in q["core_degraded"]
+        assert "Missing: X/Twitter, YouTube" in q["nudge_text"]
+
+
 class TestDisclaimerAlwaysPresent:
     """Nudge always includes no-affiliate disclaimer when present."""
 
